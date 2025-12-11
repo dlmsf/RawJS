@@ -14,7 +14,7 @@ section .data
     output_buffer times 65536 db 0
     
     ; Escape sequences for template strings
-    newline_escape db '\n', 0
+    backslash_n db '\n', 0
     
 section .text
     global _start
@@ -75,7 +75,7 @@ _start:
     jl .error_open_output
     mov r10, rax                ; Save output file descriptor
     
-    ; Minify the JavaScript
+    ; MINIFIER - Simple but correct
     mov rsi, input_buffer       ; Source pointer
     mov rdi, output_buffer      ; Destination pointer
     mov rcx, r9                 ; Input length
@@ -83,9 +83,8 @@ _start:
     ; State flags
     xor r11, r11                ; r11 = in_string (0=no, 1=single, 2=double, 3=template)
     xor r12, r12                ; r12 = in_comment (0=no, 1=line, 2=block)
-    xor r13, r13                ; r13 = last_char_was_space
-    xor r14, r14                ; r14 = escape_next (for template strings)
-    xor r15, r15                ; r15 = in_expression (for template strings)
+    xor r13, r13                ; r13 = escape_next (0=no, 1=yes)
+    xor r14, r14                ; r14 = last_char_was_space (for ASI)
     
 .minify_loop:
     test rcx, rcx
@@ -93,13 +92,13 @@ _start:
     
     mov al, [rsi]
     
-    ; Check if we're in a string
-    test r11, r11
-    jnz .handle_string
-    
     ; Check if we're in a comment
     test r12, r12
     jnz .handle_comment
+    
+    ; Check if we're in a string
+    test r11, r11
+    jnz .handle_string
     
     ; Check for start of string
     cmp al, "'"
@@ -113,13 +112,7 @@ _start:
     cmp al, '/'
     je .check_comment_start
     
-    ; Check for end of statement (for adding semicolons)
-    cmp al, '}'
-    je .handle_brace
-    cmp al, '{'
-    je .handle_open_brace
-    
-    ; Skip whitespace (unless it's meaningful)
+    ; Handle whitespace
     cmp al, ' '
     je .handle_space
     cmp al, 0x09                ; Tab
@@ -129,10 +122,10 @@ _start:
     cmp al, 0x0D                ; Carriage return
     je .skip_char
     
-    ; Default: copy character
+    ; Not whitespace - copy character
     mov [rdi], al
     inc rdi
-    mov r13, 0                  ; Reset space flag
+    mov r14, 0                  ; Reset space flag
     
 .next_char:
     inc rsi
@@ -140,31 +133,34 @@ _start:
     jmp .minify_loop
 
 .handle_space:
-    ; Only keep space if it separates identifiers
+    ; Only keep space if needed
+    cmp rsi, input_buffer
+    je .skip_char
+    
     mov bl, [rsi - 1]
     call .is_alnum
-    jc .keep_space
+    jnc .skip_char
+    
+    cmp rcx, 1
+    je .skip_char
+    
     mov bl, [rsi + 1]
     call .is_alnum
-    jc .keep_space
-    jmp .skip_char
-
-.keep_space:
+    jnc .skip_char
+    
+    ; Keep the space
     mov byte [rdi], ' '
     inc rdi
-    mov r13, 1
-    jmp .next_char
+    mov r14, 1
+    jmp .skip_char
 
 .handle_newline:
-    ; Replace newline with semicolon if appropriate
+    ; Check for automatic semicolon insertion
+    cmp rsi, input_buffer
+    je .skip_char
+    
     mov bl, [rsi - 1]
-    cmp bl, '}'
-    je .skip_char
-    cmp bl, '{'
-    je .skip_char
-    cmp bl, ';'
-    je .skip_char
-    call .is_alnum_or_paren
+    call .needs_semicolon_before
     jc .add_semicolon
     jmp .skip_char
 
@@ -172,34 +168,6 @@ _start:
     mov byte [rdi], ';'
     inc rdi
     jmp .skip_char
-
-.handle_brace:
-    ; If we're in a template string expression, handle it
-    cmp r15, 1
-    je .copy_char_template_context
-    ; If we're in a template string but not in expression, it's just a brace
-    cmp r11, 3
-    je .copy_char_template_context
-    mov [rdi], al
-    inc rdi
-    jmp .next_char
-
-.handle_open_brace:
-    ; If we're in a template string and see '{', check for expression start
-    cmp r11, 3
-    jne .not_template_brace
-    ; Check if next char is '$' to see if this is ${expression}
-    mov bl, [rsi - 1]
-    cmp bl, '$'
-    jne .not_template_brace
-    ; We have ${ - start of expression
-    mov r15, 1
-    jmp .copy_char_template_context
-
-.not_template_brace:
-    mov [rdi], al
-    inc rdi
-    jmp .next_char
 
 .start_single_string:
     mov r11, 1
@@ -220,138 +188,82 @@ _start:
     jmp .next_char
 
 .handle_string:
-    cmp r11, 3
-    je .handle_template_string
-    
-    ; Handle regular strings (single or double quoted)
-    mov [rdi], al
-    inc rdi
-    
-    ; Check for escape sequences
-    cmp al, '\'
-    je .set_escape_next
-    cmp r14, 1
-    je .reset_escape_next
-    
-    ; Check for end of string
-    cmp r11, 1
-    je .check_single_string_end
-    cmp r11, 2
-    je .check_double_string_end
-    jmp .next_char
-
-.handle_template_string:
-    ; Check for escape sequences first
-    cmp al, '\'
-    je .handle_template_escape
-    cmp r14, 1
+    ; Check for escape sequence
+    cmp r13, 1
     je .handle_escaped_char
     
-    ; Check for end of template string
+    ; Check if this starts escape
+    cmp al, '\'
+    je .start_escape
+    
+    ; Check for string end
+    cmp r11, 1
+    je .check_end_single
+    cmp r11, 2
+    je .check_end_double
+    ; Template string
     cmp al, '`'
-    je .end_template_string
-    
-    ; Check for expression start ${ in template string
-    cmp al, '{'
-    je .check_template_expression_start
-    
-    ; Check for newline in template string
-    cmp al, 0x0A
-    je .replace_template_newline
-    cmp al, 0x0D
-    je .skip_char  ; Ignore carriage return in template strings
-    
-    ; Default: copy character
-.copy_char_template_context:
+    jne .check_template_newline
+    mov r11, 0
     mov [rdi], al
     inc rdi
     jmp .next_char
 
-.handle_template_escape:
-    mov r14, 1
+.check_end_single:
+    cmp al, "'"
+    jne .copy_char_string
+    mov r11, 0
+    jmp .copy_char_string
+
+.check_end_double:
+    cmp al, '"'
+    jne .copy_char_string
+    mov r11, 0
+    jmp .copy_char_string
+
+.check_template_newline:
+    ; In template strings, newlines become \n
+    cmp al, 0x0A
+    jne .copy_char_string
+    ; Write \n escape sequence
+    push rsi
+    push rcx
+    lea rsi, [backslash_n]
+    mov rcx, 2
+    rep movsb
+    pop rcx
+    pop rsi
+    jmp .skip_char
+
+.copy_char_string:
+    mov [rdi], al
+    inc rdi
+    jmp .next_char
+
+.start_escape:
+    mov r13, 1
     mov [rdi], al
     inc rdi
     jmp .next_char
 
 .handle_escaped_char:
-    mov r14, 0
+    mov r13, 0
     mov [rdi], al
     inc rdi
-    jmp .next_char
-
-.replace_template_newline:
-    ; Replace newline with \n escape sequence in template string
-    push rsi
-    push rcx
-    lea rsi, [newline_escape]
-    mov rcx, 2
-    rep movsb
-    pop rcx
-    pop rsi
-    jmp .next_char
-
-.check_template_expression_start:
-    mov bl, [rsi - 1]
-    cmp bl, '$'
-    jne .copy_char_template_context
-    ; We have ${ - start of expression
-    mov r15, 1
-    mov [rdi - 1], al  ; Overwrite the $ we just wrote
-    mov [rdi], '{'
-    add rdi, 1
-    jmp .next_char
-
-.end_template_string:
-    ; Check if we're in an expression
-    cmp r15, 1
-    je .handle_expression_brace
-    ; End of template string
-    mov r11, 0
-    mov [rdi], al
-    inc rdi
-    jmp .next_char
-
-.handle_expression_brace:
-    ; If we see '}' while in expression mode, check if it ends the expression
-    cmp al, '}'
-    jne .copy_char_template_context
-    ; End of expression
-    mov r15, 0
-    mov [rdi], al
-    inc rdi
-    jmp .next_char
-
-.set_escape_next:
-    mov r14, 1
-    mov [rdi], al
-    inc rdi
-    jmp .next_char
-
-.reset_escape_next:
-    mov r14, 0
-    mov [rdi], al
-    inc rdi
-    jmp .next_char
-
-.check_single_string_end:
-    cmp al, "'"
-    jne .next_char
-    mov r11, 0
-    jmp .next_char
-
-.check_double_string_end:
-    cmp al, '"'
-    jne .next_char
-    mov r11, 0
     jmp .next_char
 
 .check_comment_start:
+    cmp rcx, 1
+    je .copy_char_normal
+    
     mov bl, [rsi + 1]
     cmp bl, '/'
     je .start_line_comment
     cmp bl, '*'
     je .start_block_comment
-    ; Not a comment, just a slash
+    
+    ; Not a comment
+.copy_char_normal:
     mov [rdi], al
     inc rdi
     jmp .next_char
@@ -377,10 +289,8 @@ _start:
 
 .handle_line_comment:
     cmp al, 0x0A
-    je .end_line_comment
-    jmp .skip_char
-
-.end_line_comment:
+    jne .skip_char
+    ; End of line comment
     mov r12, 0
     ; Don't copy the newline
     jmp .skip_char
@@ -388,6 +298,8 @@ _start:
 .handle_block_comment:
     cmp al, '*'
     jne .skip_char
+    cmp rcx, 1
+    je .skip_char
     mov bl, [rsi + 1]
     cmp bl, '/'
     jne .skip_char
@@ -403,9 +315,6 @@ _start:
     jmp .minify_loop
 
 .minify_done:
-    ; Add null terminator (not strictly needed for file)
-    mov byte [rdi], 0
-    
     ; Calculate output length
     mov r11, rdi
     lea rdi, [output_buffer]
@@ -430,11 +339,60 @@ _start:
     xor rdi, rdi                ; exit code 0
     syscall
 
+; Helper functions
+.is_alnum:
+    cmp bl, '0'
+    jb .not_alnum
+    cmp bl, '9'
+    jbe .is_alnum_yes
+    cmp bl, 'A'
+    jb .not_alnum
+    cmp bl, 'Z'
+    jbe .is_alnum_yes
+    cmp bl, 'a'
+    jb .not_alnum
+    cmp bl, 'z'
+    jbe .is_alnum_yes
+    cmp bl, '_'
+    je .is_alnum_yes
+    cmp bl, '$'
+    je .is_alnum_yes
+.not_alnum:
+    clc
+    ret
+.is_alnum_yes:
+    stc
+    ret
+
+.needs_semicolon_before:
+    ; Check if character in bl needs a semicolon before newline
+    cmp bl, '}'
+    je .no_semicolon_needed
+    cmp bl, '{'
+    je .no_semicolon_needed
+    cmp bl, ';'
+    je .no_semicolon_needed
+    cmp bl, ':'
+    je .no_semicolon_needed
+    call .is_alnum
+    jc .semicolon_needed
+    cmp bl, ')'
+    je .semicolon_needed
+    cmp bl, ']'
+    je .semicolon_needed
+.no_semicolon_needed:
+    clc
+    ret
+.semicolon_needed:
+    stc
+    ret
+
+; Error handlers
 .error_args:
-    mov rax, 1                  ; sys_write
-    mov rdi, 2                  ; stderr
+    mov rax, 1
+    mov rdi, 2
     lea rsi, [error_args]
-    mov rdx, 37                 ; length
+    mov rdx, 37
     syscall
     jmp .exit_error
 
@@ -471,45 +429,6 @@ _start:
     jmp .exit_error
 
 .exit_error:
-    mov rax, 60                 ; sys_exit
-    mov rdi, 1                  ; exit code 1
+    mov rax, 60
+    mov rdi, 1
     syscall
-
-; Helper function: check if char in bl is alphanumeric
-.is_alnum:
-    cmp bl, '0'
-    jb .not_alnum
-    cmp bl, '9'
-    jbe .is_alnum_yes
-    cmp bl, 'A'
-    jb .not_alnum
-    cmp bl, 'Z'
-    jbe .is_alnum_yes
-    cmp bl, 'a'
-    jb .not_alnum
-    cmp bl, 'z'
-    jbe .is_alnum_yes
-    cmp bl, '_'
-    je .is_alnum_yes
-    cmp bl, '$'
-    je .is_alnum_yes
-.not_alnum:
-    clc
-    ret
-.is_alnum_yes:
-    stc
-    ret
-
-; Helper function: check if char in bl is alphanumeric or paren/brace
-.is_alnum_or_paren:
-    cmp bl, ')'
-    je .is_alnum_or_yes
-    cmp bl, ']'
-    je .is_alnum_or_yes
-    cmp bl, '}'
-    je .is_alnum_or_yes
-    jmp .is_alnum              ; Reuse alnum check
-
-.is_alnum_or_yes:
-    stc
-    ret
