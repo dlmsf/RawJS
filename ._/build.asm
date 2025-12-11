@@ -6,6 +6,10 @@ section .data
     color3           db 0x1B, "[1;32m", 0  ; Bright green
     color4           db 0x1B, "[1;35m", 0  ; Bright magenta
     
+    ; Tags for JavaScript instances
+    js_start_tag     db "<js-start>", 0
+    js_end_tag       db "<js-end>", 10, 0   ; Newline after closing tag
+    
     ; Error messages
     err_no_file       db "Error: No input file specified.", 10, 0
     err_open          db "Error: Could not open file.", 10, 0
@@ -566,6 +570,7 @@ process_file:
 
 ; ------------------------------------------------------------
 ; PRINT CURRENT STATEMENT - Prints with proper formatting and alternating colors
+; Now includes <js-start> and <js-end> tags with matching colors
 ; ------------------------------------------------------------
 print_current_statement:
     push rbx
@@ -582,23 +587,48 @@ print_current_statement:
     ; Trim trailing spaces
     call trim_trailing_spaces
     
-    ; Use current color
+    ; Use current color for both tags and content
     mov rbx, [current_color]
     
-    ; Print with current color
+    ; Print opening tag with current color
     mov rsi, rbx
     call print_string
     
-    ; Print the statement
-    mov rsi, current_stmt
+    mov rsi, js_start_tag
     call print_string
     
-    ; Reset color
+    ; Reset color after opening tag
     mov rsi, reset_color_str
     call print_string
     
-    ; Print newline
-    mov rsi, newline
+    ; Print a space after opening tag for readability
+    mov rsi, tab
+    call print_string
+    
+    ; Print statement content with current color
+    mov rsi, rbx
+    call print_string
+    
+    mov rsi, current_stmt
+    call print_string
+    
+    ; Reset color before closing tag
+    mov rsi, reset_color_str
+    call print_string
+    
+    ; Print a space before closing tag for readability
+    mov rsi, tab
+    call print_string
+    
+    ; Print closing tag with current color
+    mov rsi, rbx
+    call print_string
+    
+    mov rsi, js_end_tag
+    call print_string
+    
+    ; Reset color (closing tag already has newline)
+    mov rsi, reset_color_str
     call print_string
 
 .done:
