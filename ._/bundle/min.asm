@@ -13,9 +13,6 @@ section .data
     input_buffer times 65536 db 0
     output_buffer times 65536 db 0
     
-    ; Escape sequences for template strings
-    backslash_n db '\n', 0
-    
 section .text
     global _start
 
@@ -33,7 +30,7 @@ _start:
     
     ; Open input file
     mov rax, 2                  ; sys_open
-    mov rsi, 0                  ; O_RDONLY
+    mov rsi, 0                  ; O_RONLY
     syscall
     cmp rax, 0
     jl .error_open_input
@@ -75,16 +72,16 @@ _start:
     jl .error_open_output
     mov r10, rax                ; Save output file descriptor
     
-    ; MINIFIER - Simple but correct
+    ; ULTRA-SIMPLE MINIFIER
+    ; Just removes whitespace and comments, but preserves everything else
     mov rsi, input_buffer       ; Source pointer
     mov rdi, output_buffer      ; Destination pointer
     mov rcx, r9                 ; Input length
     
-    ; State flags
+    ; Simple state flags
     xor r11, r11                ; r11 = in_string (0=no, 1=single, 2=double, 3=template)
     xor r12, r12                ; r12 = in_comment (0=no, 1=line, 2=block)
     xor r13, r13                ; r13 = escape_next (0=no, 1=yes)
-    xor r14, r14                ; r14 = last_char_was_space (for ASI)
     
 .minify_loop:
     test rcx, rcx
@@ -112,62 +109,56 @@ _start:
     cmp al, '/'
     je .check_comment_start
     
-    ; Handle whitespace
+    ; Remove whitespace (but be careful)
     cmp al, ' '
-    je .handle_space
+    je .maybe_remove_space
     cmp al, 0x09                ; Tab
-    je .handle_space
+    je .remove_char
     cmp al, 0x0A                ; Newline
-    je .handle_newline
+    je .remove_char
     cmp al, 0x0D                ; Carriage return
-    je .skip_char
+    je .remove_char
     
-    ; Not whitespace - copy character
+    ; Keep all other characters
     mov [rdi], al
     inc rdi
-    mov r14, 0                  ; Reset space flag
     
 .next_char:
     inc rsi
     dec rcx
     jmp .minify_loop
 
-.handle_space:
-    ; Only keep space if needed
+.maybe_remove_space:
+    ; Check if space separates two identifiers
     cmp rsi, input_buffer
-    je .skip_char
-    
-    mov bl, [rsi - 1]
-    call .is_alnum
-    jnc .skip_char
+    je .remove_char  ; Can't be first char
     
     cmp rcx, 1
-    je .skip_char
+    je .remove_char  ; Can't be last char
     
-    mov bl, [rsi + 1]
-    call .is_alnum
-    jnc .skip_char
+    ; Check characters around the space
+    mov bl, [rsi - 1]
+    mov dl, [rsi + 1]
+    
+    ; Keep space only if it separates alnum characters
+    call .is_alnum_or_dot
+    jnc .remove_char  ; Left not alnum
+    
+    push rbx
+    mov bl, dl
+    call .is_alnum_or_dot
+    pop rbx
+    jnc .remove_char  ; Right not alnum
     
     ; Keep the space
     mov byte [rdi], ' '
     inc rdi
-    mov r14, 1
-    jmp .skip_char
+    jmp .remove_char
 
-.handle_newline:
-    ; Check for automatic semicolon insertion
-    cmp rsi, input_buffer
-    je .skip_char
-    
-    mov bl, [rsi - 1]
-    call .needs_semicolon_before
-    jc .add_semicolon
-    jmp .skip_char
-
-.add_semicolon:
-    mov byte [rdi], ';'
-    inc rdi
-    jmp .skip_char
+.remove_char:
+    inc rsi
+    dec rcx
+    jmp .minify_loop
 
 .start_single_string:
     mov r11, 1
@@ -188,73 +179,54 @@ _start:
     jmp .next_char
 
 .handle_string:
-    ; Check for escape sequence
+    ; Copy string character
+    mov [rdi], al
+    inc rdi
+    
+    ; Check for escape sequences
     cmp r13, 1
-    je .handle_escaped_char
+    je .reset_escape
     
-    ; Check if this starts escape
+    ; Check if this starts an escape sequence
     cmp al, '\'
-    je .start_escape
-    
-    ; Check for string end
+    je .set_escape
+    jmp .check_string_end
+
+.set_escape:
+    mov r13, 1
+    jmp .next_char
+
+.reset_escape:
+    mov r13, 0
+    jmp .next_char
+
+.check_string_end:
+    ; Check if this ends the string (but not if escaped)
     cmp r11, 1
-    je .check_end_single
+    je .check_single_end
     cmp r11, 2
-    je .check_end_double
+    je .check_double_end
     ; Template string
     cmp al, '`'
-    jne .check_template_newline
+    jne .next_char
     mov r11, 0
-    mov [rdi], al
-    inc rdi
     jmp .next_char
 
-.check_end_single:
+.check_single_end:
     cmp al, "'"
-    jne .copy_char_string
+    jne .next_char
     mov r11, 0
-    jmp .copy_char_string
+    jmp .next_char
 
-.check_end_double:
+.check_double_end:
     cmp al, '"'
-    jne .copy_char_string
+    jne .next_char
     mov r11, 0
-    jmp .copy_char_string
-
-.check_template_newline:
-    ; In template strings, newlines become \n
-    cmp al, 0x0A
-    jne .copy_char_string
-    ; Write \n escape sequence
-    push rsi
-    push rcx
-    lea rsi, [backslash_n]
-    mov rcx, 2
-    rep movsb
-    pop rcx
-    pop rsi
-    jmp .skip_char
-
-.copy_char_string:
-    mov [rdi], al
-    inc rdi
-    jmp .next_char
-
-.start_escape:
-    mov r13, 1
-    mov [rdi], al
-    inc rdi
-    jmp .next_char
-
-.handle_escaped_char:
-    mov r13, 0
-    mov [rdi], al
-    inc rdi
     jmp .next_char
 
 .check_comment_start:
     cmp rcx, 1
-    je .copy_char_normal
+    je .copy_char_normal  ; Last character, can't be comment
     
     mov bl, [rsi + 1]
     cmp bl, '/'
@@ -262,7 +234,7 @@ _start:
     cmp bl, '*'
     je .start_block_comment
     
-    ; Not a comment
+    ; Not a comment, just a slash
 .copy_char_normal:
     mov [rdi], al
     inc rdi
@@ -289,29 +261,26 @@ _start:
 
 .handle_line_comment:
     cmp al, 0x0A
-    jne .skip_char
+    jne .skip_char_in_comment
     ; End of line comment
     mov r12, 0
-    ; Don't copy the newline
-    jmp .skip_char
+.skip_char_in_comment:
+    inc rsi
+    dec rcx
+    jmp .minify_loop
 
 .handle_block_comment:
     cmp al, '*'
-    jne .skip_char
+    jne .skip_char_in_comment
     cmp rcx, 1
-    je .skip_char
+    je .skip_char_in_comment
     mov bl, [rsi + 1]
     cmp bl, '/'
-    jne .skip_char
+    jne .skip_char_in_comment
     ; End of block comment
     mov r12, 0
     add rsi, 2
     sub rcx, 2
-    jmp .minify_loop
-
-.skip_char:
-    inc rsi
-    dec rcx
     jmp .minify_loop
 
 .minify_done:
@@ -339,8 +308,10 @@ _start:
     xor rdi, rdi                ; exit code 0
     syscall
 
-; Helper functions
-.is_alnum:
+; Helper function: check if char in bl is alnum or dot
+.is_alnum_or_dot:
+    cmp bl, '.'
+    je .is_alnum_yes
     cmp bl, '0'
     jb .not_alnum
     cmp bl, '9'
@@ -361,29 +332,6 @@ _start:
     clc
     ret
 .is_alnum_yes:
-    stc
-    ret
-
-.needs_semicolon_before:
-    ; Check if character in bl needs a semicolon before newline
-    cmp bl, '}'
-    je .no_semicolon_needed
-    cmp bl, '{'
-    je .no_semicolon_needed
-    cmp bl, ';'
-    je .no_semicolon_needed
-    cmp bl, ':'
-    je .no_semicolon_needed
-    call .is_alnum
-    jc .semicolon_needed
-    cmp bl, ')'
-    je .semicolon_needed
-    cmp bl, ']'
-    je .semicolon_needed
-.no_semicolon_needed:
-    clc
-    ret
-.semicolon_needed:
     stc
     ret
 
