@@ -22,6 +22,10 @@ case "$(uname -m)" in
         ARCH="i386"
         FORMAT="elf32"
         ;;
+    "arm"|"armv7l"|"armv8l"|"aarch64"|"arm64")
+        ARCH="arm"
+        FORMAT="elf32"
+        ;;
     *)
         echo -e "${RED}Unsupported architecture: $(uname -m)${NC}"
         exit 1
