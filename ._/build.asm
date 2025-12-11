@@ -25,10 +25,13 @@ section .data
     in_comment        db 0
     paren_depth       dd 0
     brace_depth       dd 0
+    bracket_depth     dd 0
     last_char         db 0
     skip_next_space   db 0
     in_block          db 0
     block_started     db 0
+    empty_statement   db 0
+    arrow_pending     db 0
     
     ; Color rotation
     color_index       dd 0
@@ -170,6 +173,7 @@ process_file:
     ; Initialize state
     mov dword [paren_depth], 0
     mov dword [brace_depth], 0
+    mov dword [bracket_depth], 0
     mov byte [in_string], 0
     mov byte [in_template], 0
     mov byte [in_comment], 0
@@ -178,6 +182,8 @@ process_file:
     mov byte [skip_next_space], 0
     mov byte [in_block], 0
     mov byte [block_started], 0
+    mov byte [empty_statement], 0
+    mov byte [arrow_pending], 0
     mov dword [color_index], 0
     
     ; Get first color
@@ -267,8 +273,29 @@ process_file:
     cmp al, ')'
     je .close_paren
     
+    ; Check for square brackets (arrays)
+    cmp al, '['
+    je .open_bracket
+    cmp al, ']'
+    je .close_bracket
+    
+    ; Check for equals sign (might be part of arrow function)
+    cmp al, '='
+    je .handle_equals
+    
     ; Reset skip space flag (we found a non-space)
     mov byte [skip_next_space], 0
+    
+    ; Clear empty statement flag when we find content
+    mov byte [empty_statement], 0
+    
+    ; Clear arrow pending flag for non-arrow characters
+    cmp al, '>'
+    jne .not_arrow_check
+    jmp .check_arrow
+    
+.not_arrow_check:
+    mov byte [arrow_pending], 0
     
     ; Add character to statement buffer
     call append_to_stmt
@@ -285,6 +312,12 @@ process_file:
     ; Reset skip space flag
     mov byte [skip_next_space], 0
     
+    ; Clear empty statement flag when we find content
+    mov byte [empty_statement], 0
+    
+    ; Clear arrow pending flag
+    mov byte [arrow_pending], 0
+    
     ; Add quote to statement buffer
     call append_to_stmt
     
@@ -298,6 +331,12 @@ process_file:
 .start_template:
     ; Reset skip space flag
     mov byte [skip_next_space], 0
+    
+    ; Clear empty statement flag when we find content
+    mov byte [empty_statement], 0
+    
+    ; Clear arrow pending flag
+    mov byte [arrow_pending], 0
     
     ; Add backtick to statement buffer
     call append_to_stmt
@@ -323,6 +362,12 @@ process_file:
 .not_comment:
     ; Reset skip space flag
     mov byte [skip_next_space], 0
+    
+    ; Clear empty statement flag when we find content
+    mov byte [empty_statement], 0
+    
+    ; Clear arrow pending flag
+    mov byte [arrow_pending], 0
     
     ; Just a regular slash
     call append_to_stmt
@@ -438,6 +483,64 @@ process_file:
     mov byte [skip_next_space], 1
     jmp .process_loop
 
+.handle_equals:
+    ; Reset skip space flag
+    mov byte [skip_next_space], 0
+    
+    ; Clear empty statement flag when we find content
+    mov byte [empty_statement], 0
+    
+    ; Set arrow pending flag when we see '='
+    mov byte [arrow_pending], 1
+    
+    ; Add equals to statement
+    call append_to_stmt
+    
+    ; Store as last character
+    mov [last_char], al
+    
+    jmp .process_loop
+
+.check_arrow:
+    ; Check if this '>' is part of an arrow function '=>'
+    cmp byte [arrow_pending], 1
+    jne .not_arrow
+    
+    ; It's an arrow function '=>'
+    mov byte [arrow_pending], 0
+    
+    ; Reset skip space flag
+    mov byte [skip_next_space], 0
+    
+    ; Clear empty statement flag when we find content
+    mov byte [empty_statement], 0
+    
+    ; Add '>' to statement
+    call append_to_stmt
+    
+    ; Store as last character
+    mov [last_char], al
+    
+    jmp .process_loop
+
+.not_arrow:
+    ; Reset skip space flag
+    mov byte [skip_next_space], 0
+    
+    ; Clear empty statement flag when we find content
+    mov byte [empty_statement], 0
+    
+    ; Clear arrow pending flag
+    mov byte [arrow_pending], 0
+    
+    ; Add '>' to statement
+    call append_to_stmt
+    
+    ; Store as last character
+    mov [last_char], al
+    
+    jmp .process_loop
+
 .open_brace:
     ; Reset skip space flag
     mov byte [skip_next_space], 0
@@ -451,6 +554,12 @@ process_file:
     mov byte [block_started], 1
     
 .add_brace_to_stmt:
+    ; Clear empty statement flag when we find content
+    mov byte [empty_statement], 0
+    
+    ; Clear arrow pending flag
+    mov byte [arrow_pending], 0
+    
     ; Add brace to current statement
     mov al, '{'
     mov [char_buffer], al
@@ -467,6 +576,12 @@ process_file:
     ; Reset skip space flag
     mov byte [skip_next_space], 0
     
+    ; Clear empty statement flag when we find content
+    mov byte [empty_statement], 0
+    
+    ; Clear arrow pending flag
+    mov byte [arrow_pending], 0
+    
     ; Add closing brace to statement
     mov al, '}'
     mov [char_buffer], al
@@ -478,12 +593,24 @@ process_file:
     ; Update brace depth
     dec dword [brace_depth]
     
-    ; Check if we're ending a block
+    ; Check if we're ending a block at top level (brace_depth = 0)
     cmp dword [brace_depth], 0
     jne .process_loop
     
     ; We've returned to brace depth 0 - end of block
     mov byte [in_block], 0
+    
+    ; CRITICAL FIX: Only print if we're not inside parentheses or brackets
+    ; (i.e., we're at the top level of a statement)
+    cmp dword [paren_depth], 0
+    jne .dont_print_brace
+    cmp dword [bracket_depth], 0
+    jne .dont_print_brace
+    
+    ; Check if statement is empty
+    cmp byte [empty_statement], 1
+    je .skip_empty_block
+    
     call print_current_statement
     call clear_stmt_buffer
     mov byte [stmt_started], 0
@@ -494,9 +621,28 @@ process_file:
     
     jmp .process_loop
 
+.dont_print_brace:
+    ; We're inside parentheses or brackets, so don't print yet
+    ; Just continue building the statement
+    jmp .process_loop
+
+.skip_empty_block:
+    ; Just clear the buffer without printing
+    call clear_stmt_buffer
+    mov byte [stmt_started], 0
+    mov byte [block_started], 0
+    mov byte [empty_statement], 0
+    jmp .process_loop
+
 .open_paren:
     ; Reset skip space flag
     mov byte [skip_next_space], 0
+    
+    ; Clear empty statement flag when we find content
+    mov byte [empty_statement], 0
+    
+    ; Clear arrow pending flag
+    mov byte [arrow_pending], 0
     
     ; Add to statement buffer
     call append_to_stmt
@@ -512,6 +658,12 @@ process_file:
     ; Reset skip space flag
     mov byte [skip_next_space], 0
     
+    ; Clear empty statement flag when we find content
+    mov byte [empty_statement], 0
+    
+    ; Clear arrow pending flag
+    mov byte [arrow_pending], 0
+    
     ; Add to statement buffer
     call append_to_stmt
     
@@ -522,9 +674,52 @@ process_file:
     dec dword [paren_depth]
     jmp .process_loop
 
+.open_bracket:
+    ; Reset skip space flag
+    mov byte [skip_next_space], 0
+    
+    ; Clear empty statement flag when we find content
+    mov byte [empty_statement], 0
+    
+    ; Clear arrow pending flag
+    mov byte [arrow_pending], 0
+    
+    ; Add to statement buffer
+    call append_to_stmt
+    
+    ; Store as last character
+    mov [last_char], al
+    
+    ; Update bracket depth
+    inc dword [bracket_depth]
+    jmp .process_loop
+
+.close_bracket:
+    ; Reset skip space flag
+    mov byte [skip_next_space], 0
+    
+    ; Clear empty statement flag when we find content
+    mov byte [empty_statement], 0
+    
+    ; Clear arrow pending flag
+    mov byte [arrow_pending], 0
+    
+    ; Add to statement buffer
+    call append_to_stmt
+    
+    ; Store as last character
+    mov [last_char], al
+    
+    ; Update bracket depth
+    dec dword [bracket_depth]
+    jmp .process_loop
+
 .handle_semicolon:
     ; Reset skip space flag
     mov byte [skip_next_space], 0
+    
+    ; Clear arrow pending flag
+    mov byte [arrow_pending], 0
     
     ; Add semicolon to statement
     call append_to_stmt
@@ -535,13 +730,21 @@ process_file:
     ; CRITICAL FIX: Only print if:
     ; 1. We're at top level (brace_depth = 0) AND
     ; 2. We're not inside parentheses (paren_depth = 0) AND  
-    ; 3. We're not inside a block (in_block = 0)
+    ; 3. We're not inside brackets (bracket_depth = 0) AND
+    ; 4. We're not inside a block (in_block = 0)
     cmp dword [brace_depth], 0
     jne .process_loop
     cmp dword [paren_depth], 0
     jne .process_loop
+    cmp dword [bracket_depth], 0
+    jne .process_loop
     cmp byte [in_block], 0
     jne .process_loop
+    
+    ; Check if this is an empty statement (only whitespace/semicolon)
+    call check_empty_statement
+    cmp byte [empty_statement], 1
+    je .skip_empty_statement
     
     ; This is a top-level statement outside any block or parentheses
     call print_current_statement
@@ -552,20 +755,76 @@ process_file:
     call get_next_color
     
     jmp .process_loop
+    
+.skip_empty_statement:
+    ; Skip printing empty statement
+    call clear_stmt_buffer
+    mov byte [stmt_started], 0
+    mov byte [empty_statement], 0
+    jmp .process_loop
 
 .process_done:
-    ; Print any remaining statement
+    ; Print any remaining statement (but check if it's empty)
     mov rsi, current_stmt
     call string_length
     test rax, rax
     jz .done
     
+    call check_empty_statement
+    cmp byte [empty_statement], 1
+    je .skip_final_empty
+    
     call print_current_statement
+    jmp .done
+    
+.skip_final_empty:
+    ; Don't print empty final statement
     
 .done:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; ------------------------------------------------------------
+; CHECK EMPTY STATEMENT - Checks if statement contains only whitespace/semicolon
+; ------------------------------------------------------------
+check_empty_statement:
+    push rsi
+    push rcx
+    
+    mov byte [empty_statement], 1  ; Assume empty by default
+    
+    mov rsi, current_stmt
+.check_loop:
+    mov al, [rsi]
+    cmp al, 0
+    je .done_check
+    
+    ; If we find any non-whitespace character that's not a semicolon,
+    ; then the statement is not empty
+    cmp al, ' '
+    je .next_char
+    cmp al, 9      ; Tab
+    je .next_char
+    cmp al, 10     ; Newline
+    je .next_char
+    cmp al, 13     ; Carriage return
+    je .next_char
+    cmp al, ';'
+    je .next_char
+    
+    ; Found non-whitespace content
+    mov byte [empty_statement], 0
+    jmp .done_check
+    
+.next_char:
+    inc rsi
+    jmp .check_loop
+
+.done_check:
+    pop rcx
+    pop rsi
     ret
 
 ; ------------------------------------------------------------
