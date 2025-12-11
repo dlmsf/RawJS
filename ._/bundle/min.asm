@@ -13,6 +13,9 @@ section .data
     input_buffer times 65536 db 0
     output_buffer times 65536 db 0
     
+    ; Escape sequences for template strings
+    newline_escape db '\n', 0
+    
 section .text
     global _start
 
@@ -78,11 +81,11 @@ _start:
     mov rcx, r9                 ; Input length
     
     ; State flags
-    xor r11, r11                ; r11 = in_string (0=no, 1=single, 2=double)
+    xor r11, r11                ; r11 = in_string (0=no, 1=single, 2=double, 3=template)
     xor r12, r12                ; r12 = in_comment (0=no, 1=line, 2=block)
     xor r13, r13                ; r13 = last_char_was_space
-    xor r14, r14                ; r14 = in_regex (TODO: basic implementation)
-    xor r15, r15                ; r15 = brace_count (for minification decisions)
+    xor r14, r14                ; r14 = escape_next (for template strings)
+    xor r15, r15                ; r15 = in_expression (for template strings)
     
 .minify_loop:
     test rcx, rcx
@@ -103,6 +106,8 @@ _start:
     je .start_single_string
     cmp al, '"'
     je .start_double_string
+    cmp al, '`'
+    je .start_template_string
     
     ; Check for start of comment
     cmp al, '/'
@@ -169,13 +174,29 @@ _start:
     jmp .skip_char
 
 .handle_brace:
-    dec r15                     ; Decrease brace count
+    ; If we're in a template string expression, handle it
+    cmp r15, 1
+    je .copy_char_template_context
+    ; If we're in a template string but not in expression, it's just a brace
+    cmp r11, 3
+    je .copy_char_template_context
     mov [rdi], al
     inc rdi
     jmp .next_char
 
 .handle_open_brace:
-    inc r15                     ; Increase brace count
+    ; If we're in a template string and see '{', check for expression start
+    cmp r11, 3
+    jne .not_template_brace
+    ; Check if next char is '$' to see if this is ${expression}
+    mov bl, [rsi - 1]
+    cmp bl, '$'
+    jne .not_template_brace
+    ; We have ${ - start of expression
+    mov r15, 1
+    jmp .copy_char_template_context
+
+.not_template_brace:
     mov [rdi], al
     inc rdi
     jmp .next_char
@@ -192,15 +213,124 @@ _start:
     inc rdi
     jmp .next_char
 
-.handle_string:
+.start_template_string:
+    mov r11, 3
     mov [rdi], al
     inc rdi
+    jmp .next_char
+
+.handle_string:
+    cmp r11, 3
+    je .handle_template_string
+    
+    ; Handle regular strings (single or double quoted)
+    mov [rdi], al
+    inc rdi
+    
+    ; Check for escape sequences
+    cmp al, '\'
+    je .set_escape_next
+    cmp r14, 1
+    je .reset_escape_next
     
     ; Check for end of string
     cmp r11, 1
     je .check_single_string_end
     cmp r11, 2
     je .check_double_string_end
+    jmp .next_char
+
+.handle_template_string:
+    ; Check for escape sequences first
+    cmp al, '\'
+    je .handle_template_escape
+    cmp r14, 1
+    je .handle_escaped_char
+    
+    ; Check for end of template string
+    cmp al, '`'
+    je .end_template_string
+    
+    ; Check for expression start ${ in template string
+    cmp al, '{'
+    je .check_template_expression_start
+    
+    ; Check for newline in template string
+    cmp al, 0x0A
+    je .replace_template_newline
+    cmp al, 0x0D
+    je .skip_char  ; Ignore carriage return in template strings
+    
+    ; Default: copy character
+.copy_char_template_context:
+    mov [rdi], al
+    inc rdi
+    jmp .next_char
+
+.handle_template_escape:
+    mov r14, 1
+    mov [rdi], al
+    inc rdi
+    jmp .next_char
+
+.handle_escaped_char:
+    mov r14, 0
+    mov [rdi], al
+    inc rdi
+    jmp .next_char
+
+.replace_template_newline:
+    ; Replace newline with \n escape sequence in template string
+    push rsi
+    push rcx
+    lea rsi, [newline_escape]
+    mov rcx, 2
+    rep movsb
+    pop rcx
+    pop rsi
+    jmp .next_char
+
+.check_template_expression_start:
+    mov bl, [rsi - 1]
+    cmp bl, '$'
+    jne .copy_char_template_context
+    ; We have ${ - start of expression
+    mov r15, 1
+    mov [rdi - 1], al  ; Overwrite the $ we just wrote
+    mov [rdi], '{'
+    add rdi, 1
+    jmp .next_char
+
+.end_template_string:
+    ; Check if we're in an expression
+    cmp r15, 1
+    je .handle_expression_brace
+    ; End of template string
+    mov r11, 0
+    mov [rdi], al
+    inc rdi
+    jmp .next_char
+
+.handle_expression_brace:
+    ; If we see '}' while in expression mode, check if it ends the expression
+    cmp al, '}'
+    jne .copy_char_template_context
+    ; End of expression
+    mov r15, 0
+    mov [rdi], al
+    inc rdi
+    jmp .next_char
+
+.set_escape_next:
+    mov r14, 1
+    mov [rdi], al
+    inc rdi
+    jmp .next_char
+
+.reset_escape_next:
+    mov r14, 0
+    mov [rdi], al
+    inc rdi
     jmp .next_char
 
 .check_single_string_end:
